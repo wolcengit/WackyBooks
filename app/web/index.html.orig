@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WackyBooks</title>
+  <link rel="stylesheet" href="/style.css?v=4">
+  <script type="module" src="/app.js?v=5"></script>
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="top" :class="{ 'reader-header': signed && page==='read' }">
+    <template v-if="signed && standalone">
+      <button @click="back" class="back">← 返回</button>
+      <a class="button back" href="#home">首页</a>
+    </template>
+    <a v-else class="brand" href="#home"><span class="mark" aria-hidden="true"></span> WackyBooks</a>
+    <form v-if="signed && !['read','admin','profile'].includes(page)" class="search" @submit.prevent="search">
+      <span class="search-icon" aria-hidden="true"></span>
+      <input type="search" v-model="query" placeholder="书名、作者、主题…" aria-label="搜索所有书籍" maxlength="240">
+      <button type="submit">超级搜索</button>
+    </form>
+    <a v-if="signed && page==='read' && book" class="button download" :href="bookURL(book,'file')" :download="book.Path.split('/').at(-1)">下载</a>
+    <strong v-if="page==='read'">{{ book?.Title }}</strong>
+    <strong v-if="signed && page==='admin'">后台管理</strong>
+    <strong v-if="signed && page==='profile'">个人中心</strong>
+    <details v-if="signed && page!=='read'" class="account" ref="account">
+      <summary><span class="avatar" aria-hidden="true">{{ identity?.username?.slice(0,1).toUpperCase() }}</span><span class="account-name">{{ identity?.username }}</span></summary>
+      <div class="menu">
+        <button @click="go('profile')">个人中心</button>
+        <button v-if="admin" @click="go('admin')">后台管理</button>
+        <button @click="logout">退出</button>
+      </div>
+    </details>
+  </header>
+
+  <p v-if="notice" class="notice" role="status">{{ notice }} <button @click="notice='' " aria-label="关闭通知">×</button></p>
+
+  <main v-if="!signed" class="signin">
+    <form v-if="ready" @submit.prevent="login">
+      <span class="mark" aria-hidden="true"></span>
+      <h1>{{ setup ? '设置管理员密码' : '登录书库' }}</h1>
+      <label>账户<input v-model="username" :readonly="setup" required autocomplete="username"></label>
+      <p v-if="!setup && ldapEnabled" class="admin-hint">用户名含 <code>@</code> 时使用 LDAP 登录，本地账户名不含 <code>@</code>。</p>
+      <label>密码<input v-model="password" type="password" required :minlength="setup ? 8 : null" :autocomplete="setup ? 'new-password' : 'current-password'"></label>
+      <button class="primary" :disabled="busy">{{ setup ? '设置并登录' : '登录' }}</button>
+      <a v-if="!setup && oidcEnabled" class="button oidc-login" href="/api/oidc/login">使用单点登录</a>
+    </form>
+  </main>
+
+  <div v-else class="layout" :class="{ wide: standalone }">
+    <aside v-if="!standalone" class="sidebar">
+      <nav aria-label="书架导航">
+        <a v-for="[key, label, icon] in navigation" :key="key" :href="link(key)" :class="{ active: page===key }" :aria-current="page===key ? 'page' : null"><span aria-hidden="true">{{ icon }}</span>{{ label }}</a>
+      </nav>
+      <nav class="libraries" aria-label="书库">
+        <div class="nav-title"><span>书库</span><button v-if="admin" @click="go('admin')" title="管理书库" aria-label="管理书库">＋</button></div>
+        <a v-for="lib of catalog.libraries" :key="lib.ID" :href="link('library',lib.ID)" :class="{ active: page==='library' && parts[1]===String(lib.ID) }" :aria-current="page==='library' && parts[1]===String(lib.ID) ? 'page' : null"><span aria-hidden="true">▰</span>{{ lib.Name }}</a>
+      </nav>
+    </aside>
+
+    <main v-if="page==='read'" class="reader">
+      <div v-if="book" class="reader-tools">
+        <div v-if="pageCount && !pdfFallback" class="reader-pagination">
+          <button @click="setPage(position-1)" :disabled="position===0">← 上一{{ book.Format==='epub' ? '章' : '页' }}</button>
+          <label>{{ book.Format==='epub' ? '章节' : '页码' }}
+            <input type="number" min="1" :max="pageCount" :value="position+1" @change="setPage($event.target.valueAsNumber-1); $event.target.value=position+1">
+            <span>/ {{ pageCount }}</span>
+          </label>
+          <button @click="setPage(position+1)" :disabled="position+1>=pageCount">下一{{ book.Format==='epub' ? '章' : '页' }} →</button>
+        </div>
+        <div v-if="preview?.table" class="reader-pagination">
+          <label v-if="preview.table.sheets?.length">工作表
+            <select :value="preview.table.sheet" :disabled="previewBusy" @change="changePreview(1, Number($event.target.value))">
+              <option v-for="(sheet, index) in preview.table.sheets" :key="sheet" :value="index">{{ sheet }}</option>
+            </select>
+          </label>
+          <button :disabled="previewBusy || preview.table.page<=1" @click="changePreview(preview.table.page-1)">← 上一页</button>
+          <span>第 {{ preview.table.page }} 页<span v-if="preview.table.totalRows!==undefined"> · {{ preview.table.totalRows }} 行</span></span>
+          <button :disabled="previewBusy || !preview.table.more" @click="changePreview(preview.table.page+1)">下一页 →</button>
+        </div>
+        <div v-if="preview?.type==='slides' && preview.pages" class="reader-pagination">
+          <button :disabled="previewBusy || preview.page<=1" @click="changePreview(preview.page-1)">← 上一张</button>
+          <span>幻灯片 {{ preview.page }} / {{ preview.pages }}</span>
+          <button :disabled="previewBusy || preview.page>=preview.pages" @click="changePreview(preview.page+1)">下一张 →</button>
+        </div>
+        <div class="reader-status">
+          <span v-if="progress!==null && !pdfFallback">进度 {{ progress }}%</span>
+          <span v-if="catalog.reading[book.ID]">已读 {{ durationLabel(catalog.reading[book.ID].DurationMS) }}</span>
+          <a v-if="book.Format==='pdf' && !pdfFallback" :href="bookURL(book,'file')" target="_blank" rel="noopener">打开原始 PDF ↗</a>
+          <a :href="bookURL(book,'download')" download>下载原文件</a>
+        </div>
+      </div>
+      <div v-if="book?.Format==='pdf' && pageCount && !pdfFallback" class="pdf-page" :key="book.ID+'-'+position">
+        <img :src="bookURL(book,'page')+'?n='+(position+1)" :alt="'第 '+(position+1)+' 页'" @error="pdfFallback=true">
+      </div>
+      <iframe v-if="book?.Format==='pdf' && pdfFallback" title="PDF 阅读器" :src="bookURL(book,'file')"></iframe>
+      <iframe v-if="book?.Format==='epub' && pageCount" title="EPUB 阅读器" sandbox :src="bookURL(book,'chapter')+'?n='+position"></iframe>
+      <div v-if="book?.Format==='txt'" ref="textReader" class="text-reader" @scroll.passive="textScroll"><pre>{{ bookText }}</pre></div>
+      <p v-if="previewBusy" class="reader-message" role="status">正在读取文件…</p>
+      <p v-if="previewError" class="reader-message" role="alert">{{ previewError }}</p>
+      <p v-if="preview?.truncated" class="reader-message">当前仅显示部分内容，可下载原文件查看全文。</p>
+      <div v-if="previewUsesScroll" ref="textReader" class="text-reader" @scroll.passive="textScroll">
+        <pre v-if="preview.type==='text'" class="file-text">{{ preview.text }}</pre>
+        <article v-else-if="preview.type==='markdown'" class="file-prose" v-html="preview.html"></article>
+        <article v-else class="file-prose">
+          <template v-for="(block, index) in preview.blocks" :key="index">
+            <img v-if="block.image" :src="block.image" alt="文档内嵌图片" loading="lazy">
+            <p v-else>{{ block.text }}</p>
+          </template>
+          <p v-if="!preview.blocks?.length" class="empty">文档没有可预览的内容</p>
+        </article>
+      </div>
+      <div v-if="preview?.type==='table'" class="file-table" tabindex="0" aria-label="表格预览" :key="preview.table.sheet+'-'+preview.table.page">
+        <table v-if="preview.table.rows.length || preview.table.headers.length">
+          <thead><tr><th v-for="(header, index) in preview.table.headers" :key="index" scope="col">{{ header || '列 '+(index+1) }}</th></tr></thead>
+          <tbody><tr v-for="(row, index) in preview.table.rows" :key="index">
+            <td v-for="(_, column) in preview.table.headers" :key="column">{{ row[column] }}</td>
+          </tr></tbody>
+        </table>
+        <p v-if="!preview.table.rows.length" class="empty">该页没有数据行</p>
+      </div>
+      <div v-if="preview?.type==='slides'" class="text-reader" :key="preview.page">
+        <article class="file-prose file-slide">
+          <p v-for="(block, index) in preview.blocks" :key="index">{{ block.text }}</p>
+          <p v-if="!preview.blocks?.length" class="empty">{{ preview.pages ? '该幻灯片没有可提取的文字' : '演示文稿没有幻灯片' }}</p>
+        </article>
+      </div>
+      <div v-if="preview?.type==='image'" class="file-image">
+        <img :src="preview.url" :alt="book.Title" @error="previewError='无法显示图片，可下载原文件查看。'">
+      </div>
+      <p v-if="!book || (book.Format==='epub' && pageCount===0)" class="empty">找不到可阅读的内容</p>
+    </main>
+
+    <main v-else-if="page==='admin' && admin" class="content">
+      <div class="page-heading"><h1>书库管理</h1><div class="actions"><button @click="scan" :disabled="busy">重新扫描</button><button class="primary" @click="editLibrary()">＋ 新增书库</button></div></div>
+      <div class="table-wrap">
+        <table><thead><tr><th>书库</th><th>目录</th><th>操作</th></tr></thead><tbody>
+          <tr v-for="lib in catalog.libraries" :key="lib.ID"><td>{{ lib.Name }}</td><td class="path">{{ lib.Directory }}</td><td><div class="actions"><button @click="editLibrary(lib)">编辑</button><button class="danger" @click="deleteLibrary(lib)">删除</button></div></td></tr>
+          <tr v-if="!catalog.libraries.length"><td colspan="3">暂无书库</td></tr>
+        </tbody></table>
+      </div>
+      <section class="admin-section" aria-labelledby="users-heading">
+        <div class="section-heading">
+          <h2 id="users-heading">用户管理</h2>
+          <button class="primary" @click="editUser()">＋ 新增本地用户</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>用户</th><th>来源</th><th>状态</th><th>书库授权</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr><td>Admin</td><td>本地管理员</td><td>启用</td><td>全部书库</td><td></td></tr>
+              <tr v-for="user in users" :key="user.ID">
+                <td>{{ user.Username }}</td><td>{{ user.Source==='ldap' ? 'LDAP' : user.Source==='oidc' ? 'OIDC' : '本地' }}</td>
+                <td>{{ user.Disabled ? '停用' : '启用' }}</td>
+                <td>{{ user.LibraryIDs?.length ? user.LibraryIDs.length + ' 个书库' : '未授权' }}</td>
+                <td><div class="actions">
+                  <button @click="editUser(user)">编辑</button>
+                  <button @click="editAccess(user)">书库授权</button>
+                </div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-if="ldapEnabled" class="admin-hint">LDAP 用户首次登录后会出现在此列表。</p>
+      </section>
+      <section class="ldap-panel" aria-labelledby="ldap-heading">
+        <h2 id="ldap-heading">LDAP 配置</h2>
+        <form v-if="ldapForm" class="ldap-form" @submit.prevent="ldapAction(false)">
+          <label class="ldap-toggle ldap-wide"><input v-model="ldapForm.Enabled" type="checkbox">启用 LDAP 登录</label>
+          <label>服务器地址<input v-model="ldapForm.URL" placeholder="ldaps://ldap.example.org:636" :required="ldapForm.Enabled"><small><code>ldaps://</code> 使用 TLS，<code>ldap://</code> 默认使用 StartTLS。</small></label>
+          <label>用户搜索 Base DN<input v-model="ldapForm.BaseDN" placeholder="ou=people,dc=example,dc=org" :required="ldapForm.Enabled"></label>
+          <label class="ldap-toggle ldap-wide"><input v-model="ldapForm.PlainLDAP" type="checkbox">明文 LDAP（仅用于 ldap://）</label>
+          <p v-if="ldapForm.PlainLDAP" class="admin-hint ldap-wide">服务账号和用户的密码会在应用与 LDAP 服务器之间明文传输。</p>
+          <label>绑定账号（DN 或 UPN）<input v-model="ldapForm.BindDN" placeholder="cn=reader,dc=example,dc=org"><small>目录允许匿名搜索时可留空。</small></label>
+          <label>绑定密码<input v-model="ldapForm.BindPassword" type="password" autocomplete="new-password" :placeholder="ldapForm.HasBindPassword ? '留空沿用已保存密码' : ''" :disabled="ldapForm.ClearBindPassword"></label>
+          <label v-if="ldapForm.HasBindPassword" class="ldap-toggle ldap-wide"><input v-model="ldapForm.ClearBindPassword" type="checkbox">清除已保存的绑定密码</label>
+          <label>用户过滤器<input v-model="ldapForm.UserFilter" :required="ldapForm.Enabled"><small>用 <code>{username}</code> 表示登录名。</small></label>
+          <label>用户标识属性<input v-model="ldapForm.IDAttribute" :required="ldapForm.Enabled"><small>OpenLDAP 用 <code>entryUUID</code>，Active Directory 用 <code>objectGUID</code>。目录无法读取这些属性时可填 <code>dn</code>。</small></label>
+          <label v-if="!ldapForm.PlainLDAP" class="ldap-wide">CA 证书（PEM，可选）<textarea v-model="ldapForm.CA" rows="3" placeholder="留空使用系统信任库"></textarea></label>
+          <label>测试账号（可选）<input v-model="ldapTestUsername" maxlength="512"><small>同时填写测试密码可验证实际登录流程。</small></label>
+          <label>测试密码<input v-model="ldapTestPassword" type="password" autocomplete="off" maxlength="4096"></label>
+          <div class="actions ldap-wide">
+            <button type="button" :disabled="busy" @click="ldapAction(true)">{{ ldapTestUsername || ldapTestPassword ? '测试登录' : '测试连接' }}</button>
+            <button class="primary" :disabled="busy">保存 LDAP 配置</button>
+          </div>
+        </form>
+        <p v-if="ldapError" class="error ldap-result" role="alert">{{ ldapError }}</p>
+        <p v-if="ldapMessage" class="ldap-result" role="status">{{ ldapMessage }}</p>
+      </section>
+      <section class="ldap-panel" aria-labelledby="oidc-heading">
+        <h2 id="oidc-heading">OIDC / SSO 配置</h2>
+        <form v-if="oidcForm" class="ldap-form" @submit.prevent="oidcAction(false)">
+          <label class="ldap-toggle ldap-wide"><input v-model="oidcForm.Enabled" type="checkbox">启用 OIDC 单点登录</label>
+          <label>Issuer<input v-model="oidcForm.Issuer" type="url" placeholder="https://sso.example.org" :required="oidcForm.Enabled"><small>填写身份提供方的 issuer 地址，例如 Casdoor 的服务地址。</small></label>
+          <label>回调地址<input v-model="oidcForm.RedirectURL" type="url" placeholder="https://books.example.org/api/oidc/callback" :required="oidcForm.Enabled"></label>
+          <label>Client ID<input v-model="oidcForm.ClientID" autocomplete="off" :required="oidcForm.Enabled"></label>
+          <label>Client Secret<input v-model="oidcForm.ClientSecret" type="password" autocomplete="new-password" :placeholder="oidcForm.HasClientSecret ? '留空沿用已保存密钥' : ''" :required="oidcForm.Enabled && !oidcForm.HasClientSecret"></label>
+          <label class="ldap-wide">Scopes<input v-model="oidcForm.Scopes" placeholder="openid profile email"><small>以空格分隔；openid 会自动添加。</small></label>
+          <label>管理员 Claim<input v-model="oidcForm.AdminClaim" placeholder="groups"></label>
+          <label>管理员 Claim 值<input v-model="oidcForm.AdminValue" placeholder="wackybooks-admin"><small>两项同时填写后，匹配该 Claim 的用户可管理书库。</small></label>
+          <div class="actions ldap-wide">
+            <button type="button" :disabled="busy" @click="oidcAction(true)">测试发现文档</button>
+            <button class="primary" :disabled="busy">保存 OIDC 配置</button>
+          </div>
+        </form>
+        <p v-if="oidcError" class="error ldap-result" role="alert">{{ oidcError }}</p>
+        <p v-if="oidcMessage" class="ldap-result" role="status">{{ oidcMessage }}</p>
+      </section>
+    </main>
+
+    <main v-else-if="page==='profile'" class="content">
+      <h1>个人中心</h1>
+      <dl class="profile"><dt>账户</dt><dd>{{ identity?.username }}</dd><dt>角色</dt><dd>{{ admin ? '管理员' : '读者' }}</dd><dt>来源</dt><dd>{{ identity?.source==='ldap' ? 'LDAP' : identity?.source==='oidc' ? 'OIDC' : '本地账户' }}</dd></dl>
+      <p v-if="identity?.source==='ldap'">请在 LDAP 目录中管理账户密码。</p>
+      <p v-if="identity?.source==='oidc'">请在单点登录服务中管理账户密码。</p>
+      <form v-else-if="identity?.source!=='ldap' && identity?.source!=='oidc'" class="form" @submit.prevent="changePassword">
+        <h2>修改密码</h2>
+        <label>当前密码<input v-model="currentPassword" type="password" required autocomplete="current-password"></label>
+        <label>新密码<input v-model="newPassword" type="password" required minlength="8" autocomplete="new-password"></label>
+        <button class="primary" :disabled="busy">保存密码</button>
+      </form>
+    </main>
+
+    <main v-else class="content">
+      <div class="page-heading" :class="{ 'home-banner': page==='home' }">
+        <div>
+          <h1>{{ page==='home' ? '我的书架' : title }}</h1>
+          <p v-if="page==='home'" class="library-summary">{{ catalog.libraries.length }} 个书库 <span aria-hidden="true">·</span> {{ catalog.books.length }} 本书</p>
+        </div>
+        <div v-if="page==='home'" class="book-stack" aria-hidden="true"><i></i><i></i><i></i></div>
+        <button v-if="page==='favorites'" class="primary" @click="editList">＋ 新建清单</button>
+        <button v-if="admin && page==='home' && !catalog.libraries.length" class="primary" @click="go('admin')">＋ 添加书库</button>
+      </div>
+      <div v-if="page==='search'" class="search-filters" aria-label="搜索筛选">
+        <label>书库<select v-model="searchLibrary"><option value="">所有可访问书库</option><option v-for="item in catalog.libraries" :key="item.ID" :value="item.ID">{{ item.Name }}</option></select></label>
+        <label>格式<select v-model="searchFormat"><option value="">全部格式</option><option v-for="format in formats" :key="format" :value="format">{{ format.toUpperCase() }}</option></select></label>
+        <label>排序<select v-model="searchOrder"><option value="title">书名</option><option value="favorites">收藏人数最多</option></select></label>
+      </div>
+      <template v-if="page==='library' && library">
+        <nav class="crumbs" aria-label="目录">
+          <a :href="link('library',library.ID)">根目录</a>
+          <template v-for="(segment,i) in parts.slice(2)" :key="i"><span>/</span><a :href="link(...parts.slice(0,i+3))">{{ segment }}</a></template>
+        </nav>
+      </template>
+      <div :class="{ 'library-layout': page==='library' && library }">
+      <nav v-if="page==='library' && library" class="directory-tree" aria-label="目录树">
+        <ul>
+          <li class="directory-row">
+            <a :href="link('library',library.ID)" :aria-current="parts.length===2 ? 'location' : null">根目录</a>
+          </li>
+          <li v-for="node in folderRows" :key="node.href" class="directory-row" :style="{ '--depth': node.depth }">
+            <button v-if="node.hasChildren" type="button" :aria-expanded="node.expanded" :aria-label="(node.expanded ? '折叠 ' : '展开 ')+node.name" @click="toggleFolder(node.href)">{{ node.expanded ? '▾' : '▸' }}</button>
+            <span v-else class="directory-spacer" aria-hidden="true"></span>
+            <a :href="node.href" :aria-current="currentFolder===node.href ? 'location' : null">{{ node.name }}</a>
+          </li>
+        </ul>
+      </nav>
+      <div class="shelves">
+      <p v-if="page==='search' && searchError" class="empty" role="alert">{{ searchError }}</p>
+      <p v-if="page==='search' && searchBusy && !sections[0]?.books.length" class="empty" role="status">正在搜索…</p>
+      <p v-if="!sections.length" class="empty">{{ page==='favorites' ? '暂无收藏清单' : '暂无书籍' }}</p>
+      <section v-for="section in (page==='search' && !sections[0]?.books.length && (searchBusy || searchError) ? [] : sections)" :key="section.name" class="shelf">
+        <div v-if="section.name" class="section-heading">
+          <h2>{{ section.name }}</h2>
+          <button v-if="page==='favorites'" class="danger" @click="deleteList(section.name)">删除清单</button>
+        </div>
+        <p v-if="!section.books.length" class="empty">{{ section.empty || '暂无书籍' }}</p>
+        <div v-else class="book-grid">
+          <article v-for="item in section.books" :key="item.ID">
+            <a :href="link('read',item.ID)" :aria-label="'阅读 '+item.Title" class="cover" :style="{ '--cover': coverColor(item) }">
+              <span>{{ item.Title }}</span><small>{{ item.Format.toUpperCase() }}</small>
+              <img :key="imageVersion" :src="bookURL(item,'cover')+'?v='+imageVersion" alt="" loading="lazy" @error="$event.target.hidden=true">
+            </a>
+            <div class="book-label">
+              <div>
+                <a class="book-title" :href="link('read',item.ID)">{{ item.Title }}</a>
+                <p v-if="item.Authors?.length">{{ item.Authors.join('、') }}</p>
+                <p v-if="page==='search'">{{ item.FavoriteCount }} 人收藏</p>
+                <p v-if="page==='favorites'">{{ catalog.favoriteDates[section.name]?.[item.ID] ? '收藏于 ' + dateLabel(catalog.favoriteDates[section.name][item.ID]) : '收藏日期未知' }}</p>
+                <template v-if="section.name==='最近阅读' && catalog.reading[item.ID]">
+                  <p>上次阅读 {{ dateLabel(catalog.reading[item.ID].Opened) }}</p>
+                  <p><span v-if="catalog.reading[item.ID].Progress!==null">{{ catalog.reading[item.ID].Progress }}% · </span>{{ durationLabel(catalog.reading[item.ID].DurationMS) }}</p>
+                </template>
+              </div>
+              <button class="favorite" @click="chooseLists(item)" :title="'收藏 '+item.Title" :aria-label="'收藏 '+item.Title">{{ isFavorite(item) ? '★' : '☆' }}</button>
+            </div>
+          </article>
+        </div>
+      </section>
+      <div v-if="page==='search' && searchMore" class="search-more"><button @click="loadSearch(true)" :disabled="searchBusy">加载更多</button></div>
+      </div>
+      </div>
+    </main>
+  </div>
+
+  <dialog ref="dialog" @close="closeDialog">
+    <form v-if="dialogMode==='user'" class="form" @submit.prevent="saveUser">
+      <h2>{{ userForm.ID ? '编辑用户' : '新增本地用户' }}</h2>
+      <label>用户名<input v-model="userForm.Username" :readonly="!!userForm.ID" required maxlength="128" autocomplete="off"></label>
+      <p v-if="!userForm.ID" class="admin-hint">本地账户使用不含 <code>@</code> 的用户名登录。</p>
+      <label v-if="userForm.Source==='local'">{{ userForm.ID ? '重置密码' : '初始密码' }}
+        <input v-model="userForm.Password" type="password" :required="!userForm.ID" minlength="8" maxlength="72" autocomplete="new-password" :placeholder="userForm.ID ? '留空保留当前密码' : ''">
+      </label>
+      <label class="checkbox"><input v-model="userForm.Disabled" type="checkbox">停用账户</label>
+      <p v-if="dialogError" class="error" role="alert">{{ dialogError }}</p>
+      <div class="actions"><button type="button" @click="dialog.close()">取消</button><button class="primary" :disabled="busy">保存用户</button></div>
+    </form>
+    <form v-if="dialogMode==='access'" class="form" @submit.prevent="saveAccess">
+      <h2>书库授权 · {{ accessForm.Username }}</h2>
+      <p v-if="!catalog.libraries.length" class="admin-hint">请先添加书库。</p>
+      <fieldset v-else class="library-options">
+        <legend>允许访问的书库</legend>
+        <label v-for="library in catalog.libraries" :key="library.ID" class="checkbox"><input v-model="accessForm.LibraryIDs" type="checkbox" :value="library.ID">{{ library.Name }}</label>
+      </fieldset>
+      <p v-if="dialogError" class="error" role="alert">{{ dialogError }}</p>
+      <div class="actions"><button type="button" @click="dialog.close()">取消</button><button class="primary" :disabled="busy">保存授权</button></div>
+    </form>
+    <form v-if="dialogMode==='library'" class="form" @submit.prevent="saveLibrary">
+      <h2>{{ libraryForm.ID ? '编辑书库' : '新增书库' }}</h2>
+      <label>书库名称<input v-model="libraryForm.Name" required maxlength="100"></label>
+      <label>绝对目录<input v-model="libraryForm.Directory" placeholder="/books/library1" required></label>
+      <p v-if="dialogError" class="error" role="alert">{{ dialogError }}</p>
+      <div class="actions"><button type="button" @click="dialog.close()">取消</button><button class="primary" :disabled="busy">保存</button></div>
+    </form>
+    <form v-if="dialogMode==='list'" class="form" @submit.prevent="createList">
+      <h2>新建收藏清单</h2>
+      <label>清单名称<input v-model="listName" required maxlength="60"></label>
+      <p v-if="dialogError" class="error" role="alert">{{ dialogError }}</p>
+      <div class="actions"><button type="button" @click="dialog.close()">取消</button><button class="primary" :disabled="busy">创建</button></div>
+    </form>
+    <div v-if="dialogMode==='favorites'" class="form">
+      <h2>收藏清单</h2>
+      <label v-for="(ids,name) in catalog.lists" :key="name" class="checkbox"><input type="checkbox" :checked="ids.includes(selectedBook.ID)" :disabled="busy" @change="toggleList(name)">{{ name }}</label>
+      <p v-if="dialogError" class="error" role="alert">{{ dialogError }}</p>
+      <div class="actions"><button @click="editList">新建清单</button><button class="primary" @click="dialog.close()">完成</button></div>
+    </div>
+  </dialog>
+</div>
+</body>
+</html>
